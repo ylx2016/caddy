@@ -6,6 +6,11 @@ on:
   schedule:
     - cron: '0 2 * * 0'
 
+# 添加必要的权限，允许脚本删除旧的 Releases 和 Workflow runs
+permissions:
+  actions: write
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -38,13 +43,37 @@ jobs:
             --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@naive
           mv caddy caddy-linux-arm64
 
+      # 根据当前时间生成动态的版本号标签 (例如 v20260327)
+      - name: Generate Release Tag
+        id: tag
+        run: echo "RELEASE_TAG=v$(date +'%Y%m%d%H%M')" >> $GITHUB_ENV
+
+      # 发布新的 Release
       - name: Release both versions
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Caddy Build ${{ env.RELEASE_TAG }}
           files: |
             caddy-linux-amd64
             caddy-linux-arm64
-          make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 清理旧的 Releases (最多保留 10 个)
+      - name: Delete older releases
+        uses: dev-drprasad/delete-older-releases@v0.3.3
+        with:
+          keep_latest: 10
+          delete_tags: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 清理旧的 Action Workflow 运行记录 (最多保留 6 个)
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          retain_days: 0
+          keep_minimum_runs: 6
