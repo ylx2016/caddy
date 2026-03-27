@@ -1,0 +1,50 @@
+name: Auto Build Caddy with Naive
+
+# 触发条件：支持手动触发，或者每周日凌晨 2 点自动运行
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * 0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install xcaddy
+        run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+
+      - name: Build Caddy for AMD64
+        env:
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          ~/go/bin/xcaddy build \
+            --with github.com/mholt/caddy-l4 \
+            --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@naive
+          mv caddy caddy-linux-amd64
+
+      - name: Build Caddy for ARM64
+        env:
+          GOOS: linux
+          GOARCH: arm64
+        run: |
+          ~/go/bin/xcaddy build \
+            --with github.com/mholt/caddy-l4 \
+            --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@naive
+          mv caddy caddy-linux-arm64
+
+      - name: Release both versions
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          files: |
+            caddy-linux-amd64
+            caddy-linux-arm64
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
