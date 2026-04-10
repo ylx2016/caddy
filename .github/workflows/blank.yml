@@ -25,17 +25,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 1. 获取 Caddy 最新 Release 的 Tag (例如 v2.7.6)
           CADDY_LATEST=$(curl -s https://api.github.com/repos/caddyserver/caddy/releases/latest | jq -r .tag_name)
-          
-          # 2. 获取 forwardproxy naive 分支的最新 Commit Hash 的前 7 位
           NAIVE_HASH=$(curl -s https://api.github.com/repos/klzgrad/forwardproxy/commits/naive | jq -r .sha | cut -c1-7)
-          
-          # 3. 组合成我们自己的版本号，如：v2.7.6-naive-a1b2c3d
           NEW_TAG="${CADDY_LATEST}-naive-${NAIVE_HASH}"
           echo "Generated Release Tag: $NEW_TAG"
           
-          # 4. 检查我们的仓库中是否已经有了这个版本的 Release
           if gh release view "$NEW_TAG" --repo ${{ github.repository }} >/dev/null 2>&1; then
             echo "✅ 当前版本 $NEW_TAG 已构建过，跳过本次编译。"
             echo "should_build=false" >> $GITHUB_OUTPUT
@@ -45,7 +39,7 @@ jobs:
             echo "release_tag=$NEW_TAG" >> $GITHUB_OUTPUT
           fi
 
-  # ======== 阶段 2：执行编译 (仅在发现更新时运行) ========
+  # ======== 阶段 2：执行编译与 UPX 极限压缩 ========
   build:
     needs: check-updates
     if: needs.check-updates.outputs.should_build == 'true'
@@ -69,36 +63,37 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-go-
 
-      # 【新增】安装跨平台瘦身工具（用于精简 ARM64 二进制文件）
-      - name: Install cross-platform strip tools
-        run: sudo apt-get update && sudo apt-get install -y binutils-aarch64-linux-gnu
+      # 【优化】安装 UPX 压缩工具，替代无用的 binutils
+      - name: Install UPX
+        run: sudo apt-get update && sudo apt-get install -y upx-ucl
 
       - name: Install xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
-      - name: Build and Strip Caddy for AMD64
+      - name: Build Caddy for AMD64
         run: |
           echo "Building for AMD64..."
           GOOS=linux GOARCH=amd64 ~/go/bin/xcaddy build \
             --with github.com/mholt/caddy-l4 \
             --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@naive
           mv caddy caddy-linux-amd64
-          
-          # 【优化】编译完成后，剥离 AMD64 文件的符号表以减小体积
-          strip caddy-linux-amd64
 
-      - name: Build and Strip Caddy for ARM64
+      - name: Build Caddy for ARM64
         run: |
           echo "Building for ARM64..."
           GOOS=linux GOARCH=arm64 ~/go/bin/xcaddy build \
             --with github.com/mholt/caddy-l4 \
             --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@naive
           mv caddy caddy-linux-arm64
-          
-          # 【优化】使用跨平台工具剥离 ARM64 文件的符号表以减小体积
-          aarch64-linux-gnu-strip caddy-linux-arm64
 
-      # 发布新的 Release，使用阶段 1 自动生成的优雅版本号
+      # 【新增】使用 UPX 进行最高级别 (--best) 且支持 LZMA 算法 (--lzma) 的压缩
+      - name: Compress binaries with UPX
+        run: |
+          echo "Compressing AMD64 binary..."
+          upx --best --lzma caddy-linux-amd64
+          echo "Compressing ARM64 binary..."
+          upx --best --lzma caddy-linux-arm64
+
       - name: Release both versions
         uses: softprops/action-gh-release@v2
         with:
