@@ -6,44 +6,58 @@ on:
   schedule:
     - cron: '0 2 * * 0'
 
-# 添加必要的权限，允许脚本删除旧的 Releases 和 Workflow runs
 permissions:
   actions: write
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20  # 【优化】防止异常挂起，消耗免费时长
+
     steps:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: 'stable'  # 【优化】始终使用最新稳定版 Go，提升编译性能
+          cache: false
+
+      # 【优化】手动缓存 Go 编译产物和依赖模块，大幅提升后续构建速度
+      - name: Cache Go build and mod
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-go-
 
       - name: Install xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
-      - name: Build Caddy for AMD64
-        env:
-          GOOS: linux
-          GOARCH: amd64
+      # 【优化】合并步骤，并注入 GOFLAGS 压缩二进制文件体积
+      - name: Build Caddy (AMD64 & ARM64)
         run: |
-          ~/go/bin/xcaddy build \
+          # -s -w 用于去除调试信息和符号表，减小约 25% 的文件体积
+          export GOFLAGS="-ldflags='-s -w'"
+          
+          echo "Building for AMD64..."
+          GOOS=linux GOARCH=amd64 ~/go/bin/xcaddy build \
             --with github.com/mholt/caddy-l4 \
             --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@naive
           mv caddy caddy-linux-amd64
 
-      - name: Build Caddy for ARM64
-        env:
-          GOOS: linux
-          GOARCH: arm64
-        run: |
-          ~/go/bin/xcaddy build \
+          echo "Building for ARM64..."
+          GOOS=linux GOARCH=arm64 ~/go/bin/xcaddy build \
             --with github.com/mholt/caddy-l4 \
             --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@naive
           mv caddy caddy-linux-arm64
 
-      # 根据当前时间生成动态的版本号标签 (例如 v20260327)
+      # 根据当前时间生成动态的版本号标签
       - name: Generate Release Tag
         id: tag
         run: echo "RELEASE_TAG=v$(date +'%Y%m%d%H%M')" >> $GITHUB_ENV
