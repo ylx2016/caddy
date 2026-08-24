@@ -12,6 +12,11 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# 手动触发与定时任务可能撞车，串行化避免同时推 README / 发 Release 打架。
+concurrency:
+  group: build-caddy-naive
+  cancel-in-progress: false
+
 jobs:
   # ======== 阶段 1：检查是否有代码更新 ========
   check-updates:
@@ -24,6 +29,7 @@ jobs:
         id: check
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           # 关键修复：原来两条 curl 都是匿名请求，一旦触发 GitHub API 匿名限流
@@ -44,14 +50,18 @@ jobs:
 
           NEW_TAG="${CADDY_LATEST}-naive-${NAIVE_HASH}"
           echo "Generated Release Tag: $NEW_TAG"
+          echo "release_tag=$NEW_TAG" >> $GITHUB_OUTPUT
 
-          if gh release view "$NEW_TAG" --repo ${{ github.repository }} >/dev/null 2>&1; then
+          # 手动触发(workflow_dispatch)：绕过「是否已构建」检查，强制编译。
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "🔧 手动触发：跳过更新检查，强制编译 $NEW_TAG。"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          elif gh release view "$NEW_TAG" --repo ${{ github.repository }} >/dev/null 2>&1; then
             echo "✅ 当前版本 $NEW_TAG 已构建过，跳过本次编译。"
             echo "should_build=false" >> $GITHUB_OUTPUT
           else
             echo "🚀 发现上游有新版本 $NEW_TAG，准备开始编译！"
             echo "should_build=true" >> $GITHUB_OUTPUT
-            echo "release_tag=$NEW_TAG" >> $GITHUB_OUTPUT
           fi
 
   # ======== 阶段 2：执行编译与 UPX 极限压缩 ========
@@ -72,16 +82,6 @@ jobs:
           go-version: 'stable'
           cache: false
 
-      - name: Cache Go build and mod
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
       # 【优化】安装 UPX 压缩工具，替代无用的 binutils
       - name: Install UPX
         run: sudo apt-get update && sudo apt-get install -y upx-ucl
@@ -91,38 +91,59 @@ jobs:
 
       - name: Build Caddy for AMD64
         run: |
+          set -euo pipefail
           echo "Building for AMD64..."
           GOOS=linux GOARCH=amd64 ~/go/bin/xcaddy build \
             --with github.com/mholt/caddy-l4 \
             --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@naive
           mv caddy caddy-linux-amd64
+          # 自检：runner 是 amd64，能原生跑。确认二进制可用且 naive 插件真的编进去了。
+          ./caddy-linux-amd64 version
+          ./caddy-linux-amd64 list-modules | grep -q 'http.handlers.forward_proxy' \
+            || { echo "❌ forward_proxy(naive) 模块缺失，构建无效"; exit 1; }
+          ./caddy-linux-amd64 list-modules | grep -q 'layer4' \
+            || { echo "❌ caddy-l4 模块缺失，构建无效"; exit 1; }
+          # 保留一份未压缩原始档
+          cp caddy-linux-amd64 caddy-linux-amd64-uncompressed
 
       - name: Build Caddy for ARM64
         run: |
+          set -euo pipefail
           echo "Building for ARM64..."
           GOOS=linux GOARCH=arm64 ~/go/bin/xcaddy build \
             --with github.com/mholt/caddy-l4 \
             --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@naive
           mv caddy caddy-linux-arm64
+          # arm64 在 amd64 runner 上跑不了，只能保留原始档、由 amd64 侧兜底自检
+          cp caddy-linux-arm64 caddy-linux-arm64-uncompressed
 
-      # 【新增】使用 UPX 进行最高级别 (--best) 且支持 LZMA 算法 (--lzma) 的压缩
+      # 使用 UPX 最高级别 (--best) + LZMA (--lzma) 压缩，压后再自检一次 amd64
       - name: Compress binaries with UPX
         run: |
+          set -euo pipefail
           echo "Compressing AMD64 binary..."
           upx --best --lzma caddy-linux-amd64
           echo "Compressing ARM64 binary..."
           upx --best --lzma caddy-linux-arm64
+          echo "Verifying compressed AMD64 binary still runs..."
+          ./caddy-linux-amd64 version
 
+      # 用 gh CLI 发布，替代 softprops/action-gh-release（避开其 Node20 弃用告警）。
+      # tag 已存在(手动重编)则覆盖上传资产并更新标题；否则新建。
       - name: Release both versions
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.check-updates.outputs.release_tag }}
-          name: Caddy Build ${{ needs.check-updates.outputs.release_tag }}
-          files: |
-            caddy-linux-amd64
-            caddy-linux-arm64
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check-updates.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          files="caddy-linux-amd64 caddy-linux-arm64 caddy-linux-amd64-uncompressed caddy-linux-arm64-uncompressed"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，覆盖上传资产。"
+            gh release upload "$TAG" $files --clobber
+            gh release edit "$TAG" --title "Caddy Build $TAG"
+          else
+            gh release create "$TAG" $files --title "Caddy Build $TAG" --notes "Caddy + forwardproxy@naive + caddy-l4"
+          fi
 
       # 把本次编译信息写进 main 分支的 README，产生一次仓库提交。
       # GitHub 会在「仓库 60 天无活动」时自动停用 schedule 触发的 workflow，
@@ -142,21 +163,24 @@ jobs:
 
           ## 下载
 
-          | 架构 | 文件 |
-          | --- | --- |
-          | linux/amd64 | [caddy-linux-amd64](https://github.com/__REPO__/releases/latest/download/caddy-linux-amd64) |
-          | linux/arm64 | [caddy-linux-arm64](https://github.com/__REPO__/releases/latest/download/caddy-linux-arm64) |
+          经 UPX `--best --lzma` 压缩（体积小，启动时解压进内存）；如遇低内存设备或杀软误报，改用 `-uncompressed` 原始档。
 
-          二进制已用 UPX `--best --lzma` 压缩。[查看全部 Release](https://github.com/__REPO__/releases)
+          | 架构 | 压缩版 | 原始版 |
+          | --- | --- | --- |
+          | linux/amd64 | [caddy-linux-amd64](https://github.com/__REPO__/releases/latest/download/caddy-linux-amd64) | [caddy-linux-amd64-uncompressed](https://github.com/__REPO__/releases/latest/download/caddy-linux-amd64-uncompressed) |
+          | linux/arm64 | [caddy-linux-arm64](https://github.com/__REPO__/releases/latest/download/caddy-linux-arm64) | [caddy-linux-arm64-uncompressed](https://github.com/__REPO__/releases/latest/download/caddy-linux-arm64-uncompressed) |
+
+          [查看全部 Release](https://github.com/__REPO__/releases)
 
           ## 包含插件
 
-          - `github.com/caddyserver/forwardproxy@naive`（klzgrad/forwardproxy 的 naive 分支）
+          - `github.com/klzgrad/forwardproxy@naive`（naive 分支，替换 `caddyserver/forwardproxy@caddy2`）
           - `github.com/mholt/caddy-l4`
 
           ## 说明
 
-          - 定时任务每周日 02:00 UTC 运行，仅当 Caddy 有新版本或 naive 分支有新提交时才编译。
+          - 定时任务每周日 02:00 UTC 运行，仅当 Caddy 有新版本或 naive 分支有新提交时才编译；手动触发则强制重编。
+          - 每个构建产物在发布前都做过自检（`caddy version` + 确认 forward_proxy / layer4 模块已编入）。
           - 每次构建都会更新本 README（版本号与构建时间），以此产生提交、保持仓库活跃，避免 GitHub 因「60 天无活动」自动停用定时任务。
           - 仅保留最新 3 个 Release。
 
@@ -177,18 +201,27 @@ jobs:
             echo "README 无变化，跳过提交。"
           fi
 
-      - name: Delete older releases
-        uses: dev-drprasad/delete-older-releases@v0.3.3
-        with:
-          keep_latest: 3
-          delete_tags: true
+      # 用 gh CLI 清理，替代 dev-drprasad/delete-older-releases 与
+      # Mattraks/delete-workflow-runs（两者均为老 Node20 action，且不再维护）。
+      - name: Prune old releases and workflow runs
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "== 删除多余 Release（保留最新 3 个，连同 tag）=="
+          gh release list --limit 200 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[3:] | .[].tagName' \
+            | while read -r t; do
+                [ -n "$t" ] || continue
+                echo "  删除 release+tag: $t"
+                gh release delete "$t" --yes --cleanup-tag || true
+              done
 
-      - name: Delete old workflow runs
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          repository: ${{ github.repository }}
-          retain_days: 0
-          keep_minimum_runs: 3
+          echo "== 删除旧 workflow run（保留最近 3 次；进行中的当前 run 会被跳过）=="
+          gh run list --workflow "${{ github.workflow }}" --limit 200 --json databaseId,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[3:] | .[].databaseId' \
+            | while read -r id; do
+                [ -n "$id" ] || continue
+                echo "  删除 run: $id"
+                gh run delete "$id" || true
+              done
