@@ -25,11 +25,26 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          CADDY_LATEST=$(curl -s https://api.github.com/repos/caddyserver/caddy/releases/latest | jq -r .tag_name)
-          NAIVE_HASH=$(curl -s https://api.github.com/repos/klzgrad/forwardproxy/commits/naive | jq -r .sha | cut -c1-7)
+          set -euo pipefail
+          # 关键修复：原来两条 curl 都是匿名请求，一旦触发 GitHub API 匿名限流
+          # (60次/小时)，.sha 就取不到、jq 输出字面量 "null"，于是 tag 变成了
+          # 现在看到的 v2.11.4-naive-null。带上 token 走 5000次/小时额度，并对
+          # 取值做校验，杜绝再把 null 拼进 tag。
+          auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json")
+
+          CADDY_LATEST=$(curl -fsSL "${auth[@]}" https://api.github.com/repos/caddyserver/caddy/releases/latest | jq -r .tag_name)
+          NAIVE_HASH=$(curl -fsSL "${auth[@]}" https://api.github.com/repos/klzgrad/forwardproxy/commits/naive | jq -r .sha | cut -c1-7)
+
+          if [ -z "$CADDY_LATEST" ] || [ "$CADDY_LATEST" = "null" ]; then
+            echo "❌ 获取 Caddy 最新版本失败 (得到: '$CADDY_LATEST')"; exit 1
+          fi
+          if [ -z "$NAIVE_HASH" ] || [ "$NAIVE_HASH" = "null" ]; then
+            echo "❌ 获取 NaiveProxy(forwardproxy@naive) commit 失败 (得到: '$NAIVE_HASH')"; exit 1
+          fi
+
           NEW_TAG="${CADDY_LATEST}-naive-${NAIVE_HASH}"
           echo "Generated Release Tag: $NEW_TAG"
-          
+
           if gh release view "$NEW_TAG" --repo ${{ github.repository }} >/dev/null 2>&1; then
             echo "✅ 当前版本 $NEW_TAG 已构建过，跳过本次编译。"
             echo "should_build=false" >> $GITHUB_OUTPUT
@@ -47,6 +62,10 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      # 需要 checkout 才能把版本号写回 main 分支（keep-alive）
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
@@ -104,6 +123,59 @@ jobs:
             caddy-linux-arm64
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 把本次编译信息写进 main 分支的 README，产生一次仓库提交。
+      # GitHub 会在「仓库 60 天无活动」时自动停用 schedule 触发的 workflow，
+      # 每次构建更新 README（版本号+时间）即刷新活动时间，让定时任务不被停用。
+      - name: Update README on main (keep schedule alive)
+        run: |
+          set -euo pipefail
+          cat > README.md <<'EOF'
+          # Caddy + NaiveProxy 自动构建
+
+          自动编译内置 [forwardproxy@naive](https://github.com/klzgrad/forwardproxy) 与 [caddy-l4](https://github.com/mholt/caddy-l4) 插件的 Caddy，定时检查上游更新并发布。
+
+          ## 最新版本
+
+          - **版本**：`__TAG__`
+          - **构建时间**：__NOW__
+
+          ## 下载
+
+          | 架构 | 文件 |
+          | --- | --- |
+          | linux/amd64 | [caddy-linux-amd64](https://github.com/__REPO__/releases/latest/download/caddy-linux-amd64) |
+          | linux/arm64 | [caddy-linux-arm64](https://github.com/__REPO__/releases/latest/download/caddy-linux-arm64) |
+
+          二进制已用 UPX `--best --lzma` 压缩。[查看全部 Release](https://github.com/__REPO__/releases)
+
+          ## 包含插件
+
+          - `github.com/caddyserver/forwardproxy@naive`（klzgrad/forwardproxy 的 naive 分支）
+          - `github.com/mholt/caddy-l4`
+
+          ## 说明
+
+          - 定时任务每周日 02:00 UTC 运行，仅当 Caddy 有新版本或 naive 分支有新提交时才编译。
+          - 每次构建都会更新本 README（版本号与构建时间），以此产生提交、保持仓库活跃，避免 GitHub 因「60 天无活动」自动停用定时任务。
+          - 仅保留最新 3 个 Release。
+
+          <!-- 本文件由 GitHub Actions 自动生成，请勿手动编辑 -->
+          EOF
+          sed -i \
+            -e "s|__TAG__|${{ needs.check-updates.outputs.release_tag }}|g" \
+            -e "s|__REPO__|${{ github.repository }}|g" \
+            -e "s|__NOW__|$(date -u '+%Y-%m-%d %H:%M UTC')|g" \
+            README.md
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          # 内容没变时 commit 会因无改动而失败，用 if 兜住不让整个 job 挂掉
+          if git commit -m "docs: build ${{ needs.check-updates.outputs.release_tag }}"; then
+            git push origin HEAD:${{ github.ref_name }}
+          else
+            echo "README 无变化，跳过提交。"
+          fi
 
       - name: Delete older releases
         uses: dev-drprasad/delete-older-releases@v0.3.3
