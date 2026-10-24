@@ -24,6 +24,8 @@ jobs:
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       release_tag: ${{ steps.check.outputs.release_tag }}
+      caddy_version: ${{ steps.check.outputs.caddy_version }}
+      naive_sha: ${{ steps.check.outputs.naive_sha }}
     steps:
       - name: Check latest versions of Caddy and NaiveProxy
         id: check
@@ -38,8 +40,18 @@ jobs:
           # 取值做校验，杜绝再把 null 拼进 tag。
           auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json")
 
-          CADDY_LATEST=$(curl -fsSL "${auth[@]}" https://api.github.com/repos/caddyserver/caddy/releases/latest | jq -r .tag_name)
-          NAIVE_HASH=$(curl -fsSL "${auth[@]}" https://api.github.com/repos/klzgrad/forwardproxy/commits/naive | jq -r .sha | cut -c1-7)
+          # Caddy 最新 release 只用来打「naive 还没跟进」的提示，取不到不影响构建。
+          CADDY_LATEST=$(curl -fsSL "${auth[@]}" https://api.github.com/repos/caddyserver/caddy/releases/latest | jq -r .tag_name || true)
+          NAIVE_SHA=$(curl -fsSL "${auth[@]}" https://api.github.com/repos/klzgrad/forwardproxy/commits/naive | jq -r .sha)
+          NAIVE_HASH=$(printf '%s' "$NAIVE_SHA" | cut -c1-7)
+          # 编译用的 Caddy 版本必须跟 naive 仓库里 CADDY_VERSION 文件一致。
+          # naive 的 caddy-read-idle-timeout.patch 是按该版本的行号/字段写的
+          # (它引用了 v2.11.7 的 deadlineSet 字段)，换别的 tag 会打不上补丁。
+          # 所以 tag 用 CADDY_VERSION 而不是 releases/latest，避免「编的是 A
+          # 却标成 B」这种谎报。
+          CADDY_VERSION=$(curl -fsSL \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github.raw" \
+            https://api.github.com/repos/klzgrad/forwardproxy/contents/CADDY_VERSION | tr -d '[:space:]')
 
           if [ -z "$CADDY_LATEST" ] || [ "$CADDY_LATEST" = "null" ]; then
             echo "❌ 获取 Caddy 最新版本失败 (得到: '$CADDY_LATEST')"; exit 1
@@ -47,10 +59,21 @@ jobs:
           if [ -z "$NAIVE_HASH" ] || [ "$NAIVE_HASH" = "null" ]; then
             echo "❌ 获取 NaiveProxy(forwardproxy@naive) commit 失败 (得到: '$NAIVE_HASH')"; exit 1
           fi
+          if [ -z "$CADDY_VERSION" ] || [ "$CADDY_VERSION" = "null" ]; then
+            echo "❌ 读取 naive 仓库的 CADDY_VERSION 失败 (得到: '$CADDY_VERSION')"; exit 1
+          fi
 
-          NEW_TAG="${CADDY_LATEST}-naive-${NAIVE_HASH}"
+          if [ "$CADDY_LATEST" != "$CADDY_VERSION" ]; then
+            echo "⚠️  Caddy 最新版是 $CADDY_LATEST，但 naive 仍固定在 $CADDY_VERSION。"
+            echo "    补丁只对 $CADDY_VERSION 有效，本次按 $CADDY_VERSION 编译；"
+            echo "    等 naive 更新 CADDY_VERSION 后才会跟进。"
+          fi
+
+          NEW_TAG="${CADDY_VERSION}-naive-${NAIVE_HASH}"
           echo "Generated Release Tag: $NEW_TAG"
           echo "release_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+          echo "caddy_version=$CADDY_VERSION" >> $GITHUB_OUTPUT
+          echo "naive_sha=$NAIVE_SHA" >> $GITHUB_OUTPUT
 
           # 手动触发(workflow_dispatch)：绕过「是否已构建」检查，强制编译。
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
@@ -89,13 +112,57 @@ jobs:
       - name: Install xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
+      # naive 分支的 forwardproxy.go 直接调用了 caddyhttp.IdleTimeoutsFromContext /
+      # IdleTimeoutReader.Override —— 这两个 API 只存在于 Caddy 开发分支
+      # (8f549e6df 起)，正式版 v2.11.x 里没有。naive 自己的 CI 是靠
+      # caddy-read-idle-timeout.patch 把它们 backport 进 CADDY_VERSION 指定的版本
+      # 再编译，这里必须走同样的路子：拉源码 → 打补丁 → --replace 指向打过补丁
+      # 的本地副本。只用 --with 会让 go 去拉官方 release，编译期直接报
+      # "undefined: caddyhttp.IdleTimeoutsFromContext"。
+      - name: Prepare Caddy source with naive patches
+        env:
+          CADDY_VERSION: ${{ needs.check-updates.outputs.caddy_version }}
+          NAIVE_SHA: ${{ needs.check-updates.outputs.naive_sha }}
+        run: |
+          set -euo pipefail
+          echo "Caddy: $CADDY_VERSION / naive: $NAIVE_SHA"
+
+          # 补丁必须原样保留 LF。如果 git 把工作区文件/补丁改成 CRLF，
+          # git apply 会因为上下文对不上而失败（本地已在 Windows 上复现过），
+          # 所以全流程显式关掉换行转换。
+          git config --global core.autocrlf false
+
+          # 按 check-updates 算出的确切 commit 取 naive，避免这期间上游又推新提交
+          # 导致「tag 标的是 A、编出来的是 B」。
+          git init -q .forwardproxy-naive
+          git -C .forwardproxy-naive remote add origin https://github.com/klzgrad/forwardproxy.git
+          git -C .forwardproxy-naive fetch -q --depth 1 origin "$NAIVE_SHA"
+          git -C .forwardproxy-naive checkout -q FETCH_HEAD
+
+          git clone -q --depth 1 --branch "$CADDY_VERSION" \
+            https://github.com/caddyserver/caddy.git .caddy-naive
+
+          # 两个补丁都要：read-idle-timeout 提供 naive 需要的 API，
+          # sing-quic-bbrv1 把 quic-go 换成 sagernet 的以启用 BBRv1。
+          # 补丁按 CADDY_VERSION 的行号写的，版本对不上这里会直接失败 —— 这正是
+          # 想要的：宁可不发版，也别发一个编错的二进制。
+          git -C .caddy-naive apply -v \
+            "$PWD/.forwardproxy-naive/caddy-sing-quic-bbrv1.patch" \
+            "$PWD/.forwardproxy-naive/caddy-read-idle-timeout.patch"
+
+          grep -q 'func IdleTimeoutsFromContext' .caddy-naive/modules/caddyhttp/idletimeout.go \
+            || { echo "❌ 补丁未生效：IdleTimeoutsFromContext 不存在"; exit 1; }
+          grep -q 'sing-quic/congestion_meta2' .caddy-naive/modules/caddyhttp/server.go \
+            || { echo "❌ BBR 补丁未生效"; exit 1; }
+
       - name: Build Caddy for AMD64
         run: |
           set -euo pipefail
           echo "Building for AMD64..."
-          GOOS=linux GOARCH=amd64 ~/go/bin/xcaddy build \
+          GOOS=linux GOARCH=amd64 ~/go/bin/xcaddy build "${{ needs.check-updates.outputs.caddy_version }}" \
             --with github.com/mholt/caddy-l4 \
-            --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@naive
+            --replace github.com/caddyserver/caddy/v2="$PWD/.caddy-naive" \
+            --with github.com/caddyserver/forwardproxy="$PWD/.forwardproxy-naive"
           mv caddy caddy-linux-amd64
           # 自检：runner 是 amd64，能原生跑。确认二进制可用且 naive 插件真的编进去了。
           ./caddy-linux-amd64 version
@@ -103,6 +170,9 @@ jobs:
             || { echo "❌ forward_proxy(naive) 模块缺失，构建无效"; exit 1; }
           ./caddy-linux-amd64 list-modules | grep -q 'layer4' \
             || { echo "❌ caddy-l4 模块缺失，构建无效"; exit 1; }
+          # 确认用的是打过补丁的源码（否则编译期就挂了，这里是二次保险）
+          ./caddy-linux-amd64 version | grep -q "${{ needs.check-updates.outputs.caddy_version }}" \
+            || { echo "❌ 编译出的版本与预期不符：$(./caddy-linux-amd64 version)"; exit 1; }
           # 保留一份未压缩原始档
           cp caddy-linux-amd64 caddy-linux-amd64-uncompressed
 
@@ -110,11 +180,22 @@ jobs:
         run: |
           set -euo pipefail
           echo "Building for ARM64..."
-          GOOS=linux GOARCH=arm64 ~/go/bin/xcaddy build \
+          GOOS=linux GOARCH=arm64 ~/go/bin/xcaddy build "${{ needs.check-updates.outputs.caddy_version }}" \
             --with github.com/mholt/caddy-l4 \
-            --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@naive
+            --replace github.com/caddyserver/caddy/v2="$PWD/.caddy-naive" \
+            --with github.com/caddyserver/forwardproxy="$PWD/.forwardproxy-naive"
           mv caddy caddy-linux-arm64
-          # arm64 在 amd64 runner 上跑不了，只能保留原始档、由 amd64 侧兜底自检
+          # arm64 在 amd64 runner 上跑不了，改用静态校验：ELF 头确认架构、
+          # 内嵌字符串确认 naive 与 caddy-l4 真链进去了。
+          file caddy-linux-arm64 | grep -qi 'aarch64' \
+            || { echo "❌ arm64 产物架构不对：$(file caddy-linux-arm64)"; exit 1; }
+          grep -aq 'http.handlers.forward_proxy' caddy-linux-arm64 \
+            || { echo "❌ arm64 产物缺少 forward_proxy(naive)"; exit 1; }
+          grep -aq 'caddy.listeners.layer4' caddy-linux-arm64 \
+            || { echo "❌ arm64 产物缺少 caddy-l4"; exit 1; }
+          grep -aq 'disable_insecure_upstreams_check' caddy-linux-arm64 \
+            || { echo "❌ arm64 产物不是 klzgrad/forwardproxy@naive"; exit 1; }
+          # 保留原始档
           cp caddy-linux-arm64 caddy-linux-arm64-uncompressed
 
       # 使用 UPX 最高级别 (--best) + LZMA (--lzma) 压缩，压后再自检一次 amd64
@@ -127,6 +208,11 @@ jobs:
           upx --best --lzma caddy-linux-arm64
           echo "Verifying compressed AMD64 binary still runs..."
           ./caddy-linux-amd64 version
+          ./caddy-linux-amd64 list-modules | grep -q 'http.handlers.forward_proxy' \
+            || { echo "❌ UPX 压缩后 forward_proxy 丢失"; exit 1; }
+          # 压缩后仍需是 aarch64，防止 UPX 把 ELF 头写坏（大小写兼容 UPX 的输出格式）
+          file caddy-linux-arm64 | grep -qi 'aarch64' \
+            || { echo "❌ UPX 压缩后 arm64 架构标识异常：$(file caddy-linux-arm64)"; exit 1; }
 
       # 用 gh CLI 发布，替代 softprops/action-gh-release（避开其 Node20 弃用告警）。
       # tag 已存在(手动重编)则覆盖上传资产并更新标题；否则新建。
@@ -179,8 +265,14 @@ jobs:
 
           ## 说明
 
-          - 定时任务每周日 02:00 UTC 运行，仅当 Caddy 有新版本或 naive 分支有新提交时才编译；手动触发则强制重编。
-          - 每个构建产物在发布前都做过自检（`caddy version` + 确认 forward_proxy / layer4 模块已编入）。
+          - 定时任务每周日 02:00 UTC 运行，仅当 naive 分支有新提交时才编译；手动触发则强制重编。
+          - Caddy 源码版本取自 naive 仓库的 `CADDY_VERSION`（naive 的补丁是按该版本写的），
+            不是 `caddyserver/caddy` 的最新 release —— 上游发新 release 后要等 naive 跟进才会切过去。
+          - 编译前会把 naive 的两个补丁打进 Caddy 源码：`caddy-read-idle-timeout.patch`
+            （backport `IdleTimeoutsFromContext` 等 API，naive 的 `forwardproxy.go` 依赖它）
+            与 `caddy-sing-quic-bbrv1.patch`（换用 sagernet 的 quic-go 以启用 BBRv1）。
+          - 每个构建产物在发布前都做过自检：amd64 实际运行 `caddy version` 与 `list-modules`，
+            arm64 因 runner 架构跑不了，改用 ELF 头 + 内嵌符号做静态校验。
           - 每次构建都会更新本 README（版本号与构建时间），以此产生提交、保持仓库活跃，避免 GitHub 因「60 天无活动」自动停用定时任务。
           - 仅保留最新 3 个 Release。
 
