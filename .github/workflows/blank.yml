@@ -2,12 +2,16 @@ name: Auto Build Caddy with Naive
 
 on:
   workflow_dispatch:
+    inputs:
+      force_build:
+        description: '忽略「已构建过」检查，强制重新编译？（默认否，手动跑也会先比对 Release）'
+        type: boolean
+        default: false
   schedule:
     - cron: '0 2 * * 0'
 
-permissions:
-  actions: write
-  contents: write
+# 最小权限：不再在 workflow 级给写权限，下沉到各自 job。
+# check-updates 只读 API，给 contents: read 即可。
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -21,6 +25,9 @@ jobs:
   # ======== 阶段 1：检查是否有代码更新 ========
   check-updates:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       release_tag: ${{ steps.check.outputs.release_tag }}
@@ -32,6 +39,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EVENT_NAME: ${{ github.event_name }}
+          # schedule 触发时 inputs 为空串，用 ${X:-false} 兜成 false。
+          FORCE_BUILD: ${{ inputs.force_build }}
+          # 上游内容与仓库名一律走 env 再在 bash 里引用，不直接插进脚本正文。
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           # 关键修复：原来两条 curl 都是匿名请求，一旦触发 GitHub API 匿名限流
@@ -63,6 +74,16 @@ jobs:
             echo "❌ 读取 naive 仓库的 CADDY_VERSION 失败 (得到: '$CADDY_VERSION')"; exit 1
           fi
 
+          # 上游文件内容会被拼进 Release tag、xcaddy 参数与 README 的 sed 替换串，
+          # 所以先按允许的字符集校验，杜绝把 $( ) 反引号 ; | 之类带进来。
+          # 允许 v2.11.7 以及 v2.11.7-beta.1 这类预发布后缀，其余字符一律拒绝。
+          if ! [[ "$CADDY_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.+-][A-Za-z0-9.+-]*)?$ ]]; then
+            echo "❌ CADDY_VERSION 格式异常，拒绝使用: '$CADDY_VERSION'"; exit 1
+          fi
+          if ! [[ "$NAIVE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "❌ naive commit sha 格式异常，拒绝使用: '$NAIVE_SHA'"; exit 1
+          fi
+
           if [ "$CADDY_LATEST" != "$CADDY_VERSION" ]; then
             echo "⚠️  Caddy 最新版是 $CADDY_LATEST，但 naive 仍固定在 $CADDY_VERSION。"
             echo "    补丁只对 $CADDY_VERSION 有效，本次按 $CADDY_VERSION 编译；"
@@ -75,11 +96,20 @@ jobs:
           echo "caddy_version=$CADDY_VERSION" >> $GITHUB_OUTPUT
           echo "naive_sha=$NAIVE_SHA" >> $GITHUB_OUTPUT
 
-          # 手动触发(workflow_dispatch)：绕过「是否已构建」检查，强制编译。
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "🔧 手动触发：跳过更新检查，强制编译 $NEW_TAG。"
+          # 手动触发(workflow_dispatch)可选强制编译：勾了 force_build 就跳过
+          # 「该 tag 是否已构建过」的检查；不勾则按定时任务同一套规则走，
+          # 已发过版的 tag 直接跳过（避免重复构建覆盖已发布的资产）。
+          # schedule 事件没有 inputs，FORCE_BUILD 为空，兜成 false。
+          FORCE="${FORCE_BUILD:-false}"
+          echo "触发方式: $EVENT_NAME / force_build=$FORCE"
+          if [ "$FORCE" = "true" ]; then
+            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              echo "🔧 手动触发且勾选了 force_build：跳过更新检查，强制编译 $NEW_TAG。"
+            else
+              echo "🔧 force_build=true（非手动触发，照常强制编译）。"
+            fi
             echo "should_build=true" >> $GITHUB_OUTPUT
-          elif gh release view "$NEW_TAG" --repo ${{ github.repository }} >/dev/null 2>&1; then
+          elif gh release view "$NEW_TAG" --repo "$REPO" >/dev/null 2>&1; then
             echo "✅ 当前版本 $NEW_TAG 已构建过，跳过本次编译。"
             echo "should_build=false" >> $GITHUB_OUTPUT
           else
@@ -93,11 +123,20 @@ jobs:
     if: needs.check-updates.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      # contents: write 给 Release 与 README 提交；actions: write 给清理旧 run。
+      contents: write
+      actions: write
 
     steps:
       # 需要 checkout 才能把版本号写回 main 分支（keep-alive）
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # 不把 GITHUB_TOKEN 留在 .git/config。后面会真正执行自建产物
+          # (./caddy-... version)，一旦上游代码被投毒，凭据就成了它的战利品。
+          # 需要推送时才在对应步骤临时注入，用完还原 remote。
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -156,10 +195,12 @@ jobs:
             || { echo "❌ BBR 补丁未生效"; exit 1; }
 
       - name: Build Caddy for AMD64
+        env:
+          CADDY_VERSION: ${{ needs.check-updates.outputs.caddy_version }}
         run: |
           set -euo pipefail
           echo "Building for AMD64..."
-          GOOS=linux GOARCH=amd64 ~/go/bin/xcaddy build "${{ needs.check-updates.outputs.caddy_version }}" \
+          GOOS=linux GOARCH=amd64 ~/go/bin/xcaddy build "$CADDY_VERSION" \
             --with github.com/mholt/caddy-l4 \
             --replace github.com/caddyserver/caddy/v2="$PWD/.caddy-naive" \
             --with github.com/caddyserver/forwardproxy="$PWD/.forwardproxy-naive"
@@ -171,16 +212,18 @@ jobs:
           ./caddy-linux-amd64 list-modules | grep -q 'layer4' \
             || { echo "❌ caddy-l4 模块缺失，构建无效"; exit 1; }
           # 确认用的是打过补丁的源码（否则编译期就挂了，这里是二次保险）
-          ./caddy-linux-amd64 version | grep -q "${{ needs.check-updates.outputs.caddy_version }}" \
+          ./caddy-linux-amd64 version | grep -q "$CADDY_VERSION" \
             || { echo "❌ 编译出的版本与预期不符：$(./caddy-linux-amd64 version)"; exit 1; }
           # 保留一份未压缩原始档
           cp caddy-linux-amd64 caddy-linux-amd64-uncompressed
 
       - name: Build Caddy for ARM64
+        env:
+          CADDY_VERSION: ${{ needs.check-updates.outputs.caddy_version }}
         run: |
           set -euo pipefail
           echo "Building for ARM64..."
-          GOOS=linux GOARCH=arm64 ~/go/bin/xcaddy build "${{ needs.check-updates.outputs.caddy_version }}" \
+          GOOS=linux GOARCH=arm64 ~/go/bin/xcaddy build "$CADDY_VERSION" \
             --with github.com/mholt/caddy-l4 \
             --replace github.com/caddyserver/caddy/v2="$PWD/.caddy-naive" \
             --with github.com/caddyserver/forwardproxy="$PWD/.forwardproxy-naive"
@@ -198,6 +241,34 @@ jobs:
           # 保留原始档
           cp caddy-linux-arm64 caddy-linux-arm64-uncompressed
 
+      # Windows 版：Linux runner 上只能交叉编译 + 静态校验，不能实跑。
+      # CGO_ENABLED=0 是硬要求：caddy / caddy-l4 / forwardproxy@naive 都是纯 Go，
+      # 开着 CGO 交叉到 windows 会直接编不过（没有 windows 的 gcc）。
+      # -trimpath -ldflags "-s -w" 去掉路径与调试符号，给 UPX 留更多压缩空间。
+      - name: Build Caddy for Windows AMD64
+        env:
+          CADDY_VERSION: ${{ needs.check-updates.outputs.caddy_version }}
+        run: |
+          set -euo pipefail
+          echo "Building for Windows AMD64..."
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 ~/go/bin/xcaddy build "$CADDY_VERSION" \
+            --output caddy-windows-amd64.exe \
+            --with github.com/mholt/caddy-l4 \
+            --replace github.com/caddyserver/caddy/v2="$PWD/.caddy-naive" \
+            --with github.com/caddyserver/forwardproxy="$PWD/.forwardproxy-naive" \
+            -- -trimpath -ldflags "-s -w"
+          # 静态校验：PE32+ 头确认 64 位 windows 产物、内嵌字符串确认插件真链进去了。
+          file caddy-windows-amd64.exe | grep -qi 'PE32+' \
+            || { echo "❌ windows 产物不是 64 位 PE：$(file caddy-windows-amd64.exe)"; exit 1; }
+          grep -aq 'http.handlers.forward_proxy' caddy-windows-amd64.exe \
+            || { echo "❌ windows 产物缺少 forward_proxy(naive)"; exit 1; }
+          grep -aq 'caddy.listeners.layer4' caddy-windows-amd64.exe \
+            || { echo "❌ windows 产物缺少 caddy-l4"; exit 1; }
+          grep -aq 'disable_insecure_upstreams_check' caddy-windows-amd64.exe \
+            || { echo "❌ windows 产物不是 klzgrad/forwardproxy@naive"; exit 1; }
+          # 保留原始档（UPX 版杀软误报多，留一份不压缩的给人兜底）
+          cp caddy-windows-amd64.exe caddy-windows-amd64-uncompressed.exe
+
       # 使用 UPX 最高级别 (--best) + LZMA (--lzma) 压缩，压后再自检一次 amd64
       - name: Compress binaries with UPX
         run: |
@@ -214,15 +285,42 @@ jobs:
           file caddy-linux-arm64 | grep -qi 'aarch64' \
             || { echo "❌ UPX 压缩后 arm64 架构标识异常：$(file caddy-linux-arm64)"; exit 1; }
 
+          # Windows 产物在 runner 上跑不了，压缩后只能验 PE 头 + UPX 魔数 + 自校验。
+          # 压缩后明文符号没了，模块检查只能靠压缩前那一步，这里不再重复。
+          echo "Compressing Windows AMD64 binary..."
+          if upx --best --lzma caddy-windows-amd64.exe; then
+            upx -t caddy-windows-amd64.exe >/dev/null \
+              || { echo "❌ UPX 自校验失败，windows 产物已损坏"; exit 1; }
+            file caddy-windows-amd64.exe | grep -qi 'PE32+' \
+              || { echo "❌ UPX 压缩后 windows 产物 PE 头异常：$(file caddy-windows-amd64.exe)"; exit 1; }
+            grep -aq 'UPX!' caddy-windows-amd64.exe \
+              || { echo "❌ windows 产物没有 UPX 壳特征，压缩未生效"; exit 1; }
+            echo "✅ windows 产物已加壳：$(stat -c%s caddy-windows-amd64.exe) 字节"
+          else
+            echo "⚠️ UPX 压缩 windows 产物失败，本次发布未压缩版本（有壳需求请检查 UPX 日志）。"
+          fi
+
+      # 发布物附校验和：UPX 加壳后静态审查更难，同 tag 重编又会 --clobber 覆盖资产，
+      # 下游至少能用 sha256 判断拿到的文件有没有被换过。
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          sha256sum \
+            caddy-linux-amd64 caddy-linux-arm64 \
+            caddy-linux-amd64-uncompressed caddy-linux-arm64-uncompressed \
+            caddy-windows-amd64.exe caddy-windows-amd64-uncompressed.exe \
+            > SHA256SUMS
+          cat SHA256SUMS
+
       # 用 gh CLI 发布，替代 softprops/action-gh-release（避开其 Node20 弃用告警）。
       # tag 已存在(手动重编)则覆盖上传资产并更新标题；否则新建。
-      - name: Release both versions
+      - name: Release all versions
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.check-updates.outputs.release_tag }}
         run: |
           set -euo pipefail
-          files="caddy-linux-amd64 caddy-linux-arm64 caddy-linux-amd64-uncompressed caddy-linux-arm64-uncompressed"
+          files="caddy-linux-amd64 caddy-linux-arm64 caddy-linux-amd64-uncompressed caddy-linux-arm64-uncompressed caddy-windows-amd64.exe caddy-windows-amd64-uncompressed.exe SHA256SUMS"
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG 已存在，覆盖上传资产。"
             gh release upload "$TAG" $files --clobber
@@ -235,6 +333,11 @@ jobs:
       # GitHub 会在「仓库 60 天无活动」时自动停用 schedule 触发的 workflow，
       # 每次构建更新 README（版本号+时间）即刷新活动时间，让定时任务不被停用。
       - name: Update README on main (keep schedule alive)
+        env:
+          # 一律经 env 传递，不把值直接插进 sed 替换串。
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check-updates.outputs.release_tag }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           cat > README.md <<'EOF'
@@ -255,8 +358,11 @@ jobs:
           | --- | --- | --- |
           | linux/amd64 | [caddy-linux-amd64](https://github.com/__REPO__/releases/latest/download/caddy-linux-amd64) | [caddy-linux-amd64-uncompressed](https://github.com/__REPO__/releases/latest/download/caddy-linux-amd64-uncompressed) |
           | linux/arm64 | [caddy-linux-arm64](https://github.com/__REPO__/releases/latest/download/caddy-linux-arm64) | [caddy-linux-arm64-uncompressed](https://github.com/__REPO__/releases/latest/download/caddy-linux-arm64-uncompressed) |
+          | windows/amd64 | [caddy-windows-amd64.exe](https://github.com/__REPO__/releases/latest/download/caddy-windows-amd64.exe) | [caddy-windows-amd64-uncompressed.exe](https://github.com/__REPO__/releases/latest/download/caddy-windows-amd64-uncompressed.exe) |
 
           [查看全部 Release](https://github.com/__REPO__/releases)
+
+          发布物附 `SHA256SUMS`，可用 `sha256sum -c SHA256SUMS` 校验下载是否完整、是否被替换。
 
           ## 包含插件
 
@@ -265,7 +371,8 @@ jobs:
 
           ## 说明
 
-          - 定时任务每周日 02:00 UTC 运行，仅当 naive 分支有新提交时才编译；手动触发则强制重编。
+          - 定时任务每周日 02:00 UTC 运行，仅当 naive 分支有新提交时才编译；手动触发默认同样先比对
+            Release（该 tag 已构建过则跳过），勾选 `force_build` 才强制重编并覆盖已有资产。
           - Caddy 源码版本取自 naive 仓库的 `CADDY_VERSION`（naive 的补丁是按该版本写的），
             不是 `caddyserver/caddy` 的最新 release —— 上游发新 release 后要等 naive 跟进才会切过去。
           - 编译前会把 naive 的两个补丁打进 Caddy 源码：`caddy-read-idle-timeout.patch`
@@ -273,22 +380,30 @@ jobs:
             与 `caddy-sing-quic-bbrv1.patch`（换用 sagernet 的 quic-go 以启用 BBRv1）。
           - 每个构建产物在发布前都做过自检：amd64 实际运行 `caddy version` 与 `list-modules`，
             arm64 因 runner 架构跑不了，改用 ELF 头 + 内嵌符号做静态校验。
+          - `windows/amd64` 为交叉编译（`CGO_ENABLED=0` + `-trimpath -ldflags "-s -w"`），
+            runner 上无法运行，改按 PE32+ 头 + 内嵌插件符号做静态校验；压缩后再校验 PE 头、
+            UPX 魔数与 `upx -t` 自校验。UPX 打包的 exe 在 Windows Defender 下常被误报，
+            介意就用 `-uncompressed.exe` 那份。
           - 每次构建都会更新本 README（版本号与构建时间），以此产生提交、保持仓库活跃，避免 GitHub 因「60 天无活动」自动停用定时任务。
           - 仅保留最新 3 个 Release。
 
           <!-- 本文件由 GitHub Actions 自动生成，请勿手动编辑 -->
           EOF
           sed -i \
-            -e "s|__TAG__|${{ needs.check-updates.outputs.release_tag }}|g" \
-            -e "s|__REPO__|${{ github.repository }}|g" \
+            -e "s|__TAG__|${TAG}|g" \
+            -e "s|__REPO__|${REPO}|g" \
             -e "s|__NOW__|$(date -u '+%Y-%m-%d %H:%M UTC')|g" \
             README.md
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add README.md
           # 内容没变时 commit 会因无改动而失败，用 if 兜住不让整个 job 挂掉
-          if git commit -m "docs: build ${{ needs.check-updates.outputs.release_tag }}"; then
-            git push origin HEAD:${{ github.ref_name }}
+          if git commit -m "docs: build $TAG"; then
+            # checkout 时用了 persist-credentials: false，这里临时注入 token 推送，
+            # 推完立刻把 remote 还原，避免凭据留在工作区的 git 配置里。
+            git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
+            git push origin HEAD:refs/heads/main
+            git remote set-url origin "https://github.com/${REPO}.git"
           else
             echo "README 无变化，跳过提交。"
           fi
