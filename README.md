@@ -5,7 +5,7 @@
 ## 最新版本
 
 - **版本**：`v2.11.7-naive-e747854`
-- **构建时间**：2026-10-24 23:04 UTC
+- **构建时间**：2026-11-12 00:49 UTC
 
 ## 下载
 
@@ -15,8 +15,11 @@
 | --- | --- | --- |
 | linux/amd64 | [caddy-linux-amd64](https://github.com/ylx2016/caddy/releases/latest/download/caddy-linux-amd64) | [caddy-linux-amd64-uncompressed](https://github.com/ylx2016/caddy/releases/latest/download/caddy-linux-amd64-uncompressed) |
 | linux/arm64 | [caddy-linux-arm64](https://github.com/ylx2016/caddy/releases/latest/download/caddy-linux-arm64) | [caddy-linux-arm64-uncompressed](https://github.com/ylx2016/caddy/releases/latest/download/caddy-linux-arm64-uncompressed) |
+| windows/amd64 | [caddy-windows-amd64.exe](https://github.com/ylx2016/caddy/releases/latest/download/caddy-windows-amd64.exe) | [caddy-windows-amd64-uncompressed.exe](https://github.com/ylx2016/caddy/releases/latest/download/caddy-windows-amd64-uncompressed.exe) |
 
 [查看全部 Release](https://github.com/ylx2016/caddy/releases)
+
+发布物附 `SHA256SUMS`，可用 `sha256sum -c SHA256SUMS` 校验下载是否完整、是否被替换。
 
 ## 包含插件
 
@@ -25,7 +28,8 @@
 
 ## 说明
 
-- 定时任务每周日 02:00 UTC 运行，仅当 naive 分支有新提交时才编译；手动触发则强制重编。
+- 定时任务每周日 02:00 UTC 运行，仅当 naive 分支有新提交时才编译；手动触发默认同样先比对
+  Release（该 tag 已构建过则跳过），勾选 `force_build` 才强制重编并覆盖已有资产。
 - Caddy 源码版本取自 naive 仓库的 `CADDY_VERSION`（naive 的补丁是按该版本写的），
   不是 `caddyserver/caddy` 的最新 release —— 上游发新 release 后要等 naive 跟进才会切过去。
 - 编译前会把 naive 的两个补丁打进 Caddy 源码：`caddy-read-idle-timeout.patch`
@@ -33,6 +37,11 @@
   与 `caddy-sing-quic-bbrv1.patch`（换用 sagernet 的 quic-go 以启用 BBRv1）。
 - 每个构建产物在发布前都做过自检：amd64 实际运行 `caddy version` 与 `list-modules`，
   arm64 因 runner 架构跑不了，改用 ELF 头 + 内嵌符号做静态校验。
+- `windows/amd64` 为交叉编译（`CGO_ENABLED=0`，剥离符号沿用 xcaddy 默认的
+  `-ldflags "-w -s" -trimpath`），
+  runner 上无法运行，改按 PE32+ 头 + 内嵌插件符号做静态校验；压缩后再校验 PE 头、
+  UPX 魔数与 `upx -t` 自校验。UPX 打包的 exe 在 Windows Defender 下常被误报，
+  介意就用 `-uncompressed.exe` 那份。
 - 每次构建都会更新本 README（版本号与构建时间），以此产生提交、保持仓库活跃，避免 GitHub 因「60 天无活动」自动停用定时任务。
 - 仅保留最新 3 个 Release。
 
